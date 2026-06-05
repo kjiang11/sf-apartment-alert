@@ -22,11 +22,20 @@ TARGET_NEIGHBORHOODS = [
     "bernal",
     "potrero hill",
     "potrero",
-    "mission",
+    "mission district",
     "the mission",
     "noe valley",
-    "noe",
     "dogpatch",
+]
+
+EXCLUDE_NEIGHBORHOODS = [
+    "civic center",
+    "downtown",
+    "mid-market",
+    "midmarket",
+    "soma",
+    "mission bay",
+    "tenderloin",
 ]
 
 CL_URL = (
@@ -68,6 +77,8 @@ def extract_bedrooms(text: str):
 
 def in_target_neighborhood(text: str) -> bool:
     t = text.lower()
+    if any(ex in t for ex in EXCLUDE_NEIGHBORHOODS):
+        return False
     return any(hood in t for hood in TARGET_NEIGHBORHOODS)
 
 def parse_parking(text: str) -> str:
@@ -103,6 +114,7 @@ def fetch_detail(page, url: str) -> dict:
         "sqft":    "Not listed",
         "posted":  "Unknown",
         "contact": "Not listed",
+        "photo":   "",
     }
     try:
         page.goto(url, wait_until="domcontentloaded", timeout=20000)
@@ -110,6 +122,18 @@ def fetch_detail(page, url: str) -> dict:
 
         body_el = page.query_selector("#postingbody")
         detail["body"] = body_el.inner_text().strip() if body_el else ""
+
+        # First photo
+        img_el = page.query_selector(".swipe-wrap img, #thumbs img, .gallery img, img[src*='craigslist.org']")
+        if img_el:
+            src = img_el.get_attribute("src") or ""
+            # Craigslist thumbnails use 50x50 — swap for 600x450
+            detail["photo"] = re.sub(r'\d+x\d+', '600x450', src)
+
+        # Grab the structured attributes (w/d, parking, pets, etc.)
+        attr_els = page.query_selector_all(".attrgroup span, .attrgroup a")
+        attr_text = " ".join(el.inner_text().strip() for el in attr_els)
+        detail["attrs"] = attr_text
 
         sqft_el = page.query_selector(".housing")
         if sqft_el:
@@ -230,8 +254,8 @@ def fetch_listings():
     return listings, candidates, seen
 
 # ── Email ─────────────────────────────────────────────────────────────────────
-def build_email_rows(matches: list) -> str:
-    rows = ""
+def build_cards(matches: list) -> str:
+    cards = ""
     for m in matches:
         title   = m.get("title", "")
         url     = m.get("url", "")
@@ -244,43 +268,36 @@ def build_email_rows(matches: list) -> str:
         sqft    = m.get("sqft", "Not listed")
         posted  = m.get("posted", "Unknown")
         contact = m.get("contact", "Not listed")
+        photo   = m.get("photo", "")
+        photo_html = f'<img src="{photo}" style="width:100%;height:220px;object-fit:cover;display:block">' if photo else ""
 
-        rows += f"""
-        <tr>
-          <td style="padding:14px;border-bottom:1px solid #eee;vertical-align:top">
-            <a href="{url}" style="font-weight:bold;font-size:15px;color:#1a0dab;text-decoration:none">{title}</a><br>
-            <span style="color:#888;font-size:12px">{meta}</span>
-          </td>
-          <td style="padding:14px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">{price}</td>
-          <td style="padding:14px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">{beds}</td>
-          <td style="padding:14px;border-bottom:1px solid #eee;vertical-align:top">
-            <b>Parking:</b> {parking}<br>
-            <b>Laundry:</b> {laundry}<br>
-            <b>Dishwasher:</b> {dish}<br>
-            <b>Sq ft:</b> {sqft}<br>
-            <b>Posted:</b> {posted}<br>
-            <b>Contact:</b> {contact}
-          </td>
-        </tr>"""
-    return rows
+        cards += f"""
+        <div style="background:#fff;border-radius:10px;box-shadow:0 2px 8px rgba(0,0,0,0.08);margin-bottom:24px;overflow:hidden">
+          {photo_html}
+          <div style="padding:20px">
+            <div style="display:flex;justify-content:space-between;align-items:flex-start;margin-bottom:6px">
+              <a href="{url}" style="font-size:17px;font-weight:bold;color:#1a0dab;text-decoration:none;flex:1">{title}</a>
+              <span style="font-size:18px;font-weight:bold;color:#222;white-space:nowrap;margin-left:16px">{price}</span>
+            </div>
+            <div style="color:#888;font-size:13px;margin-bottom:14px">{meta} &nbsp;·&nbsp; {beds} &nbsp;·&nbsp; Posted: {posted}</div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:8px;font-size:14px;color:#444;border-top:1px solid #eee;padding-top:14px">
+              <div><b>Parking</b><br>{parking}</div>
+              <div><b>Laundry</b><br>{laundry}</div>
+              <div><b>Dishwasher</b><br>{dish}</div>
+              <div><b>Sq ft</b><br>{sqft}</div>
+              <div style="grid-column:span 2"><b>Contact</b><br>{contact}</div>
+            </div>
+          </div>
+        </div>"""
+    return cards
 
 def send_email(matches: list, subject_prefix: str = "🏠"):
-    rows = build_email_rows(matches)
+    cards = build_cards(matches)
     count = len(matches)
     html = f"""
-    <html><body style="font-family:sans-serif;max-width:960px;margin:0 auto">
-      <h2 style="color:#333">{subject_prefix} {count} apartment listing{'s' if count != 1 else ''}</h2>
-      <table width="100%" cellspacing="0" style="border-collapse:collapse;border:1px solid #eee">
-        <thead>
-          <tr style="background:#f5f5f5">
-            <th style="padding:10px;text-align:left">Listing</th>
-            <th style="padding:10px;text-align:left">Price</th>
-            <th style="padding:10px;text-align:left">Beds</th>
-            <th style="padding:10px;text-align:left">Details</th>
-          </tr>
-        </thead>
-        <tbody>{rows}</tbody>
-      </table>
+    <html><body style="font-family:sans-serif;max-width:700px;margin:0 auto;background:#f4f4f4;padding:24px">
+      <h2 style="color:#333;margin-bottom:24px">{subject_prefix} {count} new SF apartment listing{'s' if count != 1 else ''}</h2>
+      {cards}
     </body></html>"""
 
     msg = MIMEMultipart("alternative")
@@ -333,10 +350,12 @@ def run():
             print(f"  SKIP (bedrooms: {beds}) {title[:60]}")
             continue
 
+        # Prefer structured attrs for amenity parsing, fall back to full text
+        amenity_text = item.get("attrs", "") or full_text
         item["beds"]       = beds
-        item["parking"]    = parse_parking(full_text)
-        item["laundry"]    = parse_laundry(full_text)
-        item["dishwasher"] = parse_dishwasher(full_text)
+        item["parking"]    = parse_parking(amenity_text)
+        item["laundry"]    = parse_laundry(amenity_text)
+        item["dishwasher"] = parse_dishwasher(amenity_text)
         item["sqft"]       = item.get("sqft", parse_sqft(full_text))
 
         print(f"  MATCH {title[:60]}")
