@@ -36,9 +36,7 @@ CL_URL = (
 
 # ── Daytime check ─────────────────────────────────────────────────────────────
 def is_daytime() -> bool:
-    """True if current PT time is between 7am and 10pm (PDT = UTC-7)."""
-    h = datetime.now(timezone.utc).hour
-    return h >= 14 or h < 5
+    return True  # TEMP: always send immediately for testing
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_seen() -> set:
@@ -209,6 +207,7 @@ def fetch_listings():
             price = extract_price(item["price"] + " " + title)
 
             if lid in seen:
+                print(f"  SKIP (seen) {title[:60]}")
                 continue
             if price and price > PRICE_MAX:
                 print(f"  SKIP (price ${price}) {title[:60]}")
@@ -228,7 +227,7 @@ def fetch_listings():
 
         browser.close()
 
-    return listings, candidates
+    return listings, candidates, seen
 
 # ── Email ─────────────────────────────────────────────────────────────────────
 def build_email_rows(matches: list) -> str:
@@ -316,16 +315,10 @@ def run():
     now_pt  = now_utc - timedelta(hours=7)
     print(f"UTC: {now_utc.strftime('%H:%M')} | PT: {now_pt.strftime('%I:%M %p')} | daytime={is_daytime()}")
 
-    seen = load_seen()
-    all_listings, candidates = fetch_listings()
+    all_listings, candidates, seen = fetch_listings()
     new_matches = []
 
     for item in candidates:
-        lid   = item["id"]
-        if lid in seen:
-            continue
-        seen.add(lid)
-
         title = item["title"]
         body  = item.get("body", "")
         meta  = item.get("meta", "")
