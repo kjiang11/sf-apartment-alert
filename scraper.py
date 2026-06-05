@@ -88,16 +88,23 @@ def in_target_neighborhood(text: str) -> bool:
         return False
     return any(hood in t for hood in TARGET_NEIGHBORHOODS)
 
-def parse_parking(text: str) -> str:
-    m = re.search(r'([^\n·]+parking[^\n·]*)', text, re.IGNORECASE)
-    return m.group(1).strip() if m else "Not mentioned"
+def parse_parking(attrs: list) -> str:
+    for a in attrs:
+        if re.search(r'parking', a, re.IGNORECASE):
+            return a
+    return "Not mentioned"
 
-def parse_laundry(text: str) -> str:
-    m = re.search(r'([^\n·]*(laundry|w/d|washer)[^\n·]*)', text, re.IGNORECASE)
-    return m.group(1).strip() if m else "Not mentioned"
+def parse_laundry(attrs: list) -> str:
+    for a in attrs:
+        if re.search(r'laundry|w/d|washer', a, re.IGNORECASE):
+            return a
+    return "Not mentioned"
 
-def parse_dishwasher(text: str) -> str:
-    return "Yes" if re.search(r'\bdishwasher\b', text.lower()) else "Not mentioned"
+def parse_dishwasher(attrs: list) -> str:
+    for a in attrs:
+        if re.search(r'dishwasher', a, re.IGNORECASE):
+            return "Yes"
+    return "Not mentioned"
 
 def parse_sqft(text: str) -> str:
     m = re.search(r'(\d{3,4})\s*(?:sq\.?\s*ft|sqft|square\s*feet)', text.lower())
@@ -108,6 +115,7 @@ def fetch_detail(page, url: str) -> dict:
     """Visit a listing page and extract detail fields."""
     detail = {
         "body":    "",
+        "attrs":   [],
         "sqft":    "Not listed",
         "posted":  "Unknown",
         "contact": "Not listed",
@@ -127,10 +135,9 @@ def fetch_detail(page, url: str) -> dict:
             # Craigslist thumbnails use 50x50 — swap for 600x450
             detail["photo"] = re.sub(r'\d+x\d+', '600x450', src)
 
-        # Grab the structured attributes (w/d, parking, pets, etc.)
+        # Grab the structured attributes as individual items (w/d, parking, pets, etc.)
         attr_els = page.query_selector_all(".attrgroup span, .attrgroup a")
-        attr_text = " ".join(el.inner_text().strip() for el in attr_els)
-        detail["attrs"] = attr_text
+        detail["attrs"] = [el.inner_text().strip() for el in attr_els if el.inner_text().strip()]
 
         sqft_el = page.query_selector(".housing")
         if sqft_el:
@@ -286,6 +293,23 @@ def build_cards(matches: list) -> str:
         </div>"""
     return cards
 
+def send_simple_email(subject: str, message: str):
+    now_pt = datetime.now(timezone.utc) - timedelta(hours=7)
+    html = f"""
+    <html><body style="font-family:sans-serif;max-width:700px;margin:0 auto;padding:24px;color:#555">
+      <p style="font-size:15px">{message}</p>
+      <p style="font-size:12px;color:#aaa">Checked at {now_pt.strftime('%I:%M %p')} PT</p>
+    </body></html>"""
+    msg = MIMEMultipart("alternative")
+    msg["Subject"] = subject
+    msg["From"]    = SENDER
+    msg["To"]      = RECIPIENT
+    msg.attach(MIMEText(html, "html"))
+    with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
+        s.login(SENDER, APP_PASSWORD)
+        s.sendmail(SENDER, RECIPIENT, msg.as_string())
+    print("Sent no-results notification.")
+
 def send_email(matches: list, subject_prefix: str = "🏠"):
     cards = build_cards(matches)
     count = len(matches)
@@ -345,12 +369,11 @@ def run():
             print(f"  SKIP (bedrooms: {beds}) {title[:60]}")
             continue
 
-        # Prefer structured attrs for amenity parsing, fall back to full text
-        amenity_text = item.get("attrs", "") or full_text
+        attrs = item.get("attrs", [])
         item["beds"]       = beds
-        item["parking"]    = parse_parking(amenity_text)
-        item["laundry"]    = parse_laundry(amenity_text)
-        item["dishwasher"] = parse_dishwasher(amenity_text)
+        item["parking"]    = parse_parking(attrs)
+        item["laundry"]    = parse_laundry(attrs)
+        item["dishwasher"] = parse_dishwasher(attrs)
         item["sqft"]       = item.get("sqft", parse_sqft(full_text))
 
         print(f"  MATCH {title[:60]}")
@@ -369,6 +392,7 @@ def run():
             send_email(new_matches)
         else:
             print("No new matching listings.")
+            send_simple_email("🔍 No new listings found", "No new matching apartments found this check.")
     else:
         if new_matches:
             pending = load_pending()
