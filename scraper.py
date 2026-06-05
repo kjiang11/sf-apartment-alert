@@ -15,6 +15,7 @@ PENDING_FILE = "pending_listings.json"
 RECIPIENT    = "hmj.firstclass@gmail.com"
 SENDER       = os.environ.get("GMAIL_ADDRESS")
 APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+PRICE_MIN    = 2000
 PRICE_MAX    = 4000
 
 TARGET_NEIGHBORHOODS = [
@@ -40,12 +41,18 @@ EXCLUDE_NEIGHBORHOODS = [
 
 CL_URL = (
     "https://sfbay.craigslist.org/search/sfc/apa"
-    "?max_price=4000&availabilityMode=0&sale_date=all+dates"
+    "?min_price=2000&max_price=4000&availabilityMode=0&sale_date=all+dates"
 )
 
 # ── Daytime check ─────────────────────────────────────────────────────────────
 def is_daytime() -> bool:
-    return True  # TEMP: always send immediately for testing
+    """True between 8am and 11:30pm PT (PDT = UTC-7): UTC 15:00–06:30."""
+    now = datetime.now(timezone.utc)
+    h, m = now.hour, now.minute
+    # Daytime in UTC: 15:00 to 06:29 (next day)
+    after_start  = (h > 15) or (h == 15 and m >= 0)
+    before_end   = (h < 6) or (h == 6 and m < 30)
+    return after_start or before_end
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_seen() -> set:
@@ -82,22 +89,12 @@ def in_target_neighborhood(text: str) -> bool:
     return any(hood in t for hood in TARGET_NEIGHBORHOODS)
 
 def parse_parking(text: str) -> str:
-    t = text.lower()
-    if re.search(r'\bno parking\b|\bparking not\b|\bstreet parking only\b', t):
-        return "No parking"
-    if re.search(r'\bparking included\b|\bparking available\b|\bgarage\b|\bcarport\b|\boff.street parking\b|\bparking space\b', t):
-        return "Parking available"
-    if re.search(r'\bparking\b', t):
-        return "Parking (see listing)"
-    return "Not mentioned"
+    m = re.search(r'([^\n·]+parking[^\n·]*)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else "Not mentioned"
 
 def parse_laundry(text: str) -> str:
-    t = text.lower()
-    if re.search(r'in.unit\s*(w/?d|washer|laundry)|washer.{0,10}dryer.{0,20}in.unit|in.unit laundry', t):
-        return "In-unit W/D"
-    if re.search(r'\bw[/\-]?d\b|washer.{0,10}dryer|laundry\s*(room|in\s*building|on.site|on\s*site)', t):
-        return "W/D in building"
-    return "Not accessible / not mentioned"
+    m = re.search(r'([^\n·]*(laundry|w/d|washer)[^\n·]*)', text, re.IGNORECASE)
+    return m.group(1).strip() if m else "Not mentioned"
 
 def parse_dishwasher(text: str) -> str:
     return "Yes" if re.search(r'\bdishwasher\b', text.lower()) else "Not mentioned"
@@ -233,7 +230,7 @@ def fetch_listings():
             if lid in seen:
                 print(f"  SKIP (seen) {title[:60]}")
                 continue
-            if price and price > PRICE_MAX:
+            if price and (price < PRICE_MIN or price > PRICE_MAX):
                 print(f"  SKIP (price ${price}) {title[:60]}")
                 continue
             if re.search(r'\bfurnished\b', (title + meta).lower()) and \
@@ -267,7 +264,6 @@ def build_cards(matches: list) -> str:
         dish    = m.get("dishwasher", "Not mentioned")
         sqft    = m.get("sqft", "Not listed")
         posted  = m.get("posted", "Unknown")
-        contact = m.get("contact", "Not listed")
         photo   = m.get("photo", "")
         photo_html = f'<img src="{photo}" style="width:100%;height:220px;object-fit:cover;display:block">' if photo else ""
 
@@ -285,7 +281,6 @@ def build_cards(matches: list) -> str:
               <div><b>Laundry</b><br>{laundry}</div>
               <div><b>Dishwasher</b><br>{dish}</div>
               <div><b>Sq ft</b><br>{sqft}</div>
-              <div style="grid-column:span 2"><b>Contact</b><br>{contact}</div>
             </div>
           </div>
         </div>"""

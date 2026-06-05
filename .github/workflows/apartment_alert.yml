@@ -2,7 +2,7 @@ name: Apartment Alert
 
 on:
   schedule:
-    - cron: "0 */3 * * *"   # every 3 hours
+    - cron: "*/30 * * * *"  # every 30 minutes
   workflow_dispatch:          # allow manual trigger from GitHub UI
 
 jobs:
