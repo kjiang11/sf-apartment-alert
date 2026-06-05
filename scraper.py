@@ -3,52 +3,42 @@ import os
 import re
 import smtplib
 import time
-from datetime import date, datetime, timezone, timedelta
+from datetime import datetime, timezone, timedelta
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 
 from playwright.sync_api import sync_playwright
 
 # ── Config ────────────────────────────────────────────────────────────────────
-SEEN_FILE        = "seen_listings.json"
-PENDING_FILE     = "pending_listings.json"
-RECIPIENT        = "mcsaxon25@gmail.com"
-SENDER           = os.environ.get("GMAIL_ADDRESS")
-APP_PASSWORD     = os.environ.get("GMAIL_APP_PASSWORD")
-MOVE_IN_CUTOFF   = date(2026, 8, 15)
-PRICE_HARD_MAX   = 5000
-MIN_SCORE        = 5
+SEEN_FILE    = "seen_listings.json"
+PENDING_FILE = "pending_listings.json"
+RECIPIENT    = "hmj.firstclass@gmail.com"
+SENDER       = os.environ.get("GMAIL_ADDRESS")
+APP_PASSWORD = os.environ.get("GMAIL_APP_PASSWORD")
+PRICE_MAX    = 4000
 
-def is_daytime() -> bool:
-    """Return True if current PT time is between 7am and 10pm.
-    PDT = UTC-7, so 7am PT = 14:00 UTC, 10pm PT = 05:00 UTC next day.
-    Daytime in UTC: hour >= 14 OR hour < 5
-    """
-    h = datetime.now(timezone.utc).hour
-    return h >= 14 or h < 5
+TARGET_NEIGHBORHOODS = [
+    "bernal heights",
+    "bernal",
+    "potrero hill",
+    "potrero",
+    "mission",
+    "the mission",
+    "noe valley",
+    "noe",
+    "dogpatch",
+]
 
 CL_URL = (
     "https://sfbay.craigslist.org/search/sfc/apa"
-    "?max_price=5000&min_bedrooms=1&availabilityMode=0&sale_date=all+dates"
+    "?max_price=4000&availabilityMode=0&sale_date=all+dates"
 )
 
-# ── Scoring ───────────────────────────────────────────────────────────────────
-NEIGHBORHOOD_SCORES = {
-    "inner richmond":        3,
-    "pacific heights":       3,
-    "pac heights":           3,
-    "lower pacific heights": 3,
-    "lower pac heights":     3,
-    "presidio heights":      3,
-    "marina":                3,
-    "nopa":                  2,
-    "north of panhandle":    2,
-    "hayes valley":          2,
-    "haight ashbury":        1,
-    "haight-ashbury":        1,
-    "upper haight":          1,
-    "the haight":            1,
-}
+# ── Daytime check ─────────────────────────────────────────────────────────────
+def is_daytime() -> bool:
+    """True if current PT time is between 7am and 10pm (PDT = UTC-7)."""
+    h = datetime.now(timezone.utc).hour
+    return h >= 14 or h < 5
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def load_seen() -> set:
@@ -71,85 +61,88 @@ def extract_price(text: str):
 def extract_bedrooms(text: str):
     t = text.lower()
     if re.search(r'\b(studio|efficiency)\b', t):
-        return 0
+        return "Studio"
     m = re.search(r'(\d)\s*(?:br|bed|bedroom)', t)
     if m:
-        return int(m.group(1))
-    return None
+        n = int(m.group(1))
+        return f"{n}BR"
+    return "?"
 
-def is_move_in_too_late(text: str) -> bool:
+def in_target_neighborhood(text: str) -> bool:
     t = text.lower()
-    months = {
-        "january":1,"february":2,"march":3,"april":4,"may":5,"june":6,
-        "july":7,"august":8,"september":9,"october":10,"november":11,"december":12,
-        "jan":1,"feb":2,"mar":3,"apr":4,"jun":6,"jul":7,"aug":8,
-        "sep":9,"oct":10,"nov":11,"dec":12,
+    return any(hood in t for hood in TARGET_NEIGHBORHOODS)
+
+def parse_parking(text: str) -> str:
+    t = text.lower()
+    if re.search(r'\bno parking\b|\bparking not\b|\bstreet parking only\b', t):
+        return "No parking"
+    if re.search(r'\bparking included\b|\bparking available\b|\bgarage\b|\bcarport\b|\boff.street parking\b|\bparking space\b', t):
+        return "Parking available"
+    if re.search(r'\bparking\b', t):
+        return "Parking (see listing)"
+    return "Not mentioned"
+
+def parse_laundry(text: str) -> str:
+    t = text.lower()
+    if re.search(r'in.unit\s*(w/?d|washer|laundry)|washer.{0,10}dryer.{0,20}in.unit|in.unit laundry', t):
+        return "In-unit W/D"
+    if re.search(r'\bw[/\-]?d\b|washer.{0,10}dryer|laundry\s*(room|in\s*building|on.site|on\s*site)', t):
+        return "W/D in building"
+    return "Not accessible / not mentioned"
+
+def parse_dishwasher(text: str) -> str:
+    return "Yes" if re.search(r'\bdishwasher\b', text.lower()) else "Not mentioned"
+
+def parse_sqft(text: str) -> str:
+    m = re.search(r'(\d{3,4})\s*(?:sq\.?\s*ft|sqft|square\s*feet)', text.lower())
+    return f"{m.group(1)} sq ft" if m else "Not listed"
+
+# ── Fetch detail page ─────────────────────────────────────────────────────────
+def fetch_detail(page, url: str) -> dict:
+    """Visit a listing page and extract detail fields."""
+    detail = {
+        "body":    "",
+        "sqft":    "Not listed",
+        "posted":  "Unknown",
+        "contact": "Not listed",
     }
-    for month_name, month_num in months.items():
-        pattern = rf'{month_name}\s+(\d{{1,2}})'
-        m = re.search(pattern, t)
-        if m:
-            day = int(m.group(1))
-            try:
-                move_in = date(2026, month_num, day)
-                if move_in >= MOVE_IN_CUTOFF:
-                    return True
-            except ValueError:
-                pass
-    return False
+    try:
+        page.goto(url, wait_until="domcontentloaded", timeout=20000)
+        time.sleep(1)
 
-def score_listing(title: str, body: str, price):
-    text = (title + " " + body).lower()
-    score = 0
-    reasons = []
+        body_el = page.query_selector("#postingbody")
+        detail["body"] = body_el.inner_text().strip() if body_el else ""
 
-    # Neighborhood
-    hood_score = 0
-    for hood, pts in NEIGHBORHOOD_SCORES.items():
-        if hood in text:
-            hood_score = max(hood_score, pts)
-    if hood_score == 0:
-        return 0, ["not in target neighborhood"], None
-    score += hood_score
-    reasons.append(f"neighborhood +{hood_score}")
+        sqft_el = page.query_selector(".housing")
+        if sqft_el:
+            detail["sqft"] = parse_sqft(sqft_el.inner_text())
+        if detail["sqft"] == "Not listed":
+            detail["sqft"] = parse_sqft(detail["body"])
 
-    # Bedrooms
-    beds = extract_bedrooms(title + " " + body)
-    if beds == 0:
-        return 0, ["studio excluded"], beds
-    elif beds == 2:
-        score += 3; reasons.append("2BR +3")
-    elif beds and beds >= 3:
-        score += 2.5; reasons.append("3BR+ +2.5")
-    elif beds == 1:
-        score += 2.5; reasons.append("1BR +2.5")
+        time_el = page.query_selector("time.date.timeago")
+        if time_el:
+            detail["posted"] = time_el.get_attribute("title") or time_el.inner_text().strip()
 
-    # Price
-    if price is None:
-        score += 1; reasons.append("price unknown +1")
-    elif price <= 4500:
-        score += 2.5; reasons.append("≤$4500 +2.5")
-    elif price <= 5000:
-        score += 1.5; reasons.append("≤$5000 +1.5")
+        reply_el = page.query_selector(".reply-button, .replylink, #replylink")
+        if reply_el:
+            detail["contact"] = reply_el.inner_text().strip() or "See listing reply button"
 
-    # Amenities
-    if re.search(r'\bw[/\-]?d\b|washer.{0,10}dryer|in.unit laundry', text):
-        if re.search(r'in.unit|in unit', text):
-            score += 2; reasons.append("W/D in unit +2")
-        else:
-            score += 0.8; reasons.append("W/D in building +0.8")
-    if re.search(r'\bparking\b|\bgarage\b|\bcarport\b', text):
-        score += 1.5; reasons.append("parking +1.5")
-    if re.search(r'\bpatio\b|\bdeck\b|\byard\b|\boutdoor\b|\bbalcony\b', text):
-        score += 1.2; reasons.append("outdoor space +1.2")
-    if re.search(r'\bdishwasher\b', text):
-        score += 1; reasons.append("dishwasher +1")
-    if re.search(r'\bpets ok\b|\bpet friendly\b|\bdogs ok\b|\bcats ok\b|\bpets welcome\b|\bpets allowed\b', text):
-        score += 1.5; reasons.append("pets ok +1.5")
+        # Try to find an email/phone in body text
+        phone_match = re.search(r'(\(?\d{3}\)?[\s.\-]\d{3}[\s.\-]\d{4})', detail["body"])
+        email_match = re.search(r'[\w.\-]+@[\w.\-]+\.\w+', detail["body"])
+        if phone_match or email_match:
+            parts = []
+            if phone_match:
+                parts.append(phone_match.group(1))
+            if email_match:
+                parts.append(email_match.group(0))
+            detail["contact"] = ", ".join(parts)
 
-    return round(score, 1), reasons, beds
+    except Exception as e:
+        print(f"    Detail fetch error: {e}")
+    return detail
 
-# ── Scraping with Playwright ──────────────────────────────────────────────────
+# ── Scraping ──────────────────────────────────────────────────────────────────
 def fetch_listings():
     listings = []
     with sync_playwright() as p:
@@ -166,24 +159,6 @@ def fetch_listings():
         page.goto(CL_URL, wait_until="domcontentloaded", timeout=30000)
         time.sleep(3)
 
-        # Debug: print a snippet of the HTML so we can see the real structure
-        html = page.content()
-        print(f"  Page length: {len(html)} chars")
-        # Find first <li or first result-like element
-        import re as _re
-        snippet_match = _re.search(r'<li[\s][^>]{0,200}>', html)
-        print(f"  First <li>: {snippet_match.group(0) if snippet_match else 'none found'}")
-        # try to find any class with 'result' in it
-        result_classes = _re.findall(r'class="([^"]*result[^"]*)"', html)
-        print(f"  Result classes: {result_classes[:5]}")
-        # try gallery/listing patterns
-        for pattern in ["gallery-card", "cl-search-result", "result-row", "listing"]:
-            idx = html.find(pattern)
-            if idx > 0:
-                print(f"  Found '{pattern}' at {idx}: ...{html[idx:idx+200]}...")
-                break
-
-        # Try multiple selectors
         selectors = [
             "li.cl-search-result",
             "li.gallery-card",
@@ -194,15 +169,13 @@ def fetch_listings():
         items = []
         for sel in selectors:
             items = page.query_selector_all(sel)
-            print(f"  Selector '{sel}': {len(items)} items")
             if items:
+                print(f"  Found {len(items)} listings with selector '{sel}'")
                 break
-
-        print(f"  Using {len(items)} listing elements")
 
         for item in items:
             try:
-                link_el = item.query_selector("a.cl-app-anchor")
+                link_el  = item.query_selector("a.cl-app-anchor")
                 title_el = item.query_selector(".label")
                 price_el = item.query_selector(".priceinfo")
                 hood_el  = item.query_selector(".meta")
@@ -210,11 +183,10 @@ def fetch_listings():
                 if not link_el or not title_el:
                     continue
 
-                url   = link_el.get_attribute("href") or ""
-                title = title_el.inner_text().strip()
+                url        = link_el.get_attribute("href") or ""
+                title      = title_el.inner_text().strip()
                 price_text = price_el.inner_text().strip() if price_el else ""
                 hood_text  = hood_el.inner_text().strip()  if hood_el  else ""
-
                 listing_id = url.split("/")[-1].replace(".html", "")
 
                 listings.append({
@@ -223,43 +195,89 @@ def fetch_listings():
                     "title": title,
                     "price": price_text,
                     "meta":  hood_text,
-                    "body":  "",
                 })
             except Exception as e:
                 print(f"  Error parsing item: {e}")
 
+        # Now visit each candidate's detail page
+        seen = load_seen()
+        candidates = []
+        for item in listings:
+            lid   = item["id"]
+            title = item["title"]
+            meta  = item["meta"]
+            price = extract_price(item["price"] + " " + title)
+
+            if lid in seen:
+                continue
+            if price and price > PRICE_MAX:
+                print(f"  SKIP (price ${price}) {title[:60]}")
+                continue
+            if re.search(r'\bfurnished\b', (title + meta).lower()) and \
+               not re.search(r'\bunfurnished\b', (title + meta).lower()):
+                print(f"  SKIP (furnished) {title[:60]}")
+                continue
+
+            candidates.append(item)
+
+        print(f"  Fetching detail pages for {len(candidates)} candidates...")
+        for item in candidates:
+            print(f"    {item['title'][:60]}")
+            detail = fetch_detail(page, item["url"])
+            item.update(detail)
+
         browser.close()
-    return listings
+
+    return listings, candidates
 
 # ── Email ─────────────────────────────────────────────────────────────────────
-def send_email(matches: list, subject_prefix: str = "🏠"):
+def build_email_rows(matches: list) -> str:
     rows = ""
     for m in matches:
-        beds = m.get("beds")
-        beds_label = f"{beds}BR" if beds is not None else "?"
+        title   = m.get("title", "")
+        url     = m.get("url", "")
+        meta    = m.get("meta", "")
+        price   = m.get("price", "?")
+        beds    = m.get("beds", "?")
+        parking = m.get("parking", "Not mentioned")
+        laundry = m.get("laundry", "Not mentioned")
+        dish    = m.get("dishwasher", "Not mentioned")
+        sqft    = m.get("sqft", "Not listed")
+        posted  = m.get("posted", "Unknown")
+        contact = m.get("contact", "Not listed")
+
         rows += f"""
         <tr>
-          <td style="padding:12px;border-bottom:1px solid #eee;">
-            <a href="{m['url']}" style="font-weight:bold;color:#1a0dab;text-decoration:none;">{m['title']}</a><br>
-            <span style="color:#888;font-size:13px">{m['meta']}</span>
+          <td style="padding:14px;border-bottom:1px solid #eee;vertical-align:top">
+            <a href="{url}" style="font-weight:bold;font-size:15px;color:#1a0dab;text-decoration:none">{title}</a><br>
+            <span style="color:#888;font-size:12px">{meta}</span>
           </td>
-          <td style="padding:12px;border-bottom:1px solid #eee;white-space:nowrap">{m['price']}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;white-space:nowrap">{beds_label}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;">{m['score']}</td>
-          <td style="padding:12px;border-bottom:1px solid #eee;font-size:12px;color:#555">{', '.join(m['reasons'])}</td>
+          <td style="padding:14px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">{price}</td>
+          <td style="padding:14px;border-bottom:1px solid #eee;white-space:nowrap;vertical-align:top">{beds}</td>
+          <td style="padding:14px;border-bottom:1px solid #eee;vertical-align:top">
+            <b>Parking:</b> {parking}<br>
+            <b>Laundry:</b> {laundry}<br>
+            <b>Dishwasher:</b> {dish}<br>
+            <b>Sq ft:</b> {sqft}<br>
+            <b>Posted:</b> {posted}<br>
+            <b>Contact:</b> {contact}
+          </td>
         </tr>"""
+    return rows
 
+def send_email(matches: list, subject_prefix: str = "🏠"):
+    rows = build_email_rows(matches)
+    count = len(matches)
     html = f"""
-    <html><body style="font-family:sans-serif;max-width:900px;margin:0 auto">
-      <h2 style="color:#333">{subject_prefix} {len(matches)} SF Apartment{'s' if len(matches)>1 else ''}</h2>
+    <html><body style="font-family:sans-serif;max-width:960px;margin:0 auto">
+      <h2 style="color:#333">{subject_prefix} {count} apartment listing{'s' if count != 1 else ''}</h2>
       <table width="100%" cellspacing="0" style="border-collapse:collapse;border:1px solid #eee">
         <thead>
           <tr style="background:#f5f5f5">
             <th style="padding:10px;text-align:left">Listing</th>
             <th style="padding:10px;text-align:left">Price</th>
             <th style="padding:10px;text-align:left">Beds</th>
-            <th style="padding:10px;text-align:left">Score</th>
-            <th style="padding:10px;text-align:left">Why</th>
+            <th style="padding:10px;text-align:left">Details</th>
           </tr>
         </thead>
         <tbody>{rows}</tbody>
@@ -267,7 +285,7 @@ def send_email(matches: list, subject_prefix: str = "🏠"):
     </body></html>"""
 
     msg = MIMEMultipart("alternative")
-    msg["Subject"] = f"{subject_prefix} {len(matches)} new SF apartment{'s' if len(matches)>1 else ''} found"
+    msg["Subject"] = f"{subject_prefix} {count} new SF apartment{'s' if count != 1 else ''} found"
     msg["From"]    = SENDER
     msg["To"]      = RECIPIENT
     msg.attach(MIMEText(html, "html"))
@@ -275,7 +293,7 @@ def send_email(matches: list, subject_prefix: str = "🏠"):
     with smtplib.SMTP_SSL("smtp.gmail.com", 465) as s:
         s.login(SENDER, APP_PASSWORD)
         s.sendmail(SENDER, RECIPIENT, msg.as_string())
-    print(f"Email sent with {len(matches)} listings.")
+    print(f"Email sent: {count} listings.")
 
 # ── Pending (overnight) helpers ───────────────────────────────────────────────
 def load_pending() -> list:
@@ -295,67 +313,63 @@ def clear_pending():
 # ── Main ──────────────────────────────────────────────────────────────────────
 def run():
     now_utc = datetime.now(timezone.utc)
-    now_pt = now_utc - timedelta(hours=7)
+    now_pt  = now_utc - timedelta(hours=7)
     print(f"UTC: {now_utc.strftime('%H:%M')} | PT: {now_pt.strftime('%I:%M %p')} | daytime={is_daytime()}")
 
     seen = load_seen()
-    listings = fetch_listings()
+    all_listings, candidates = fetch_listings()
     new_matches = []
 
-    for item in listings:
-        lid = item["id"]
+    for item in candidates:
+        lid   = item["id"]
         if lid in seen:
             continue
         seen.add(lid)
 
         title = item["title"]
-        body  = item["meta"]
-        price = extract_price(item["price"] + " " + title)
+        body  = item.get("body", "")
+        meta  = item.get("meta", "")
+        full_text = title + " " + body + " " + meta
 
-        # Hard filters
-        if price and price > PRICE_HARD_MAX:
-            print(f"  SKIP (price) {title[:60]}")
-            continue
-        if re.search(r'\bfurnished\b', (title + body).lower()) and \
-           not re.search(r'\bunfurnished\b', (title + body).lower()):
-            print(f"  SKIP (furnished) {title[:60]}")
-            continue
-        if is_move_in_too_late(title + " " + body):
-            print(f"  SKIP (move-in too late) {title[:60]}")
+        if not in_target_neighborhood(full_text):
+            print(f"  SKIP (neighborhood) {title[:60]}")
             continue
 
-        score, reasons, beds = score_listing(title, body, price)
-        flag = "✅ MATCH" if score >= MIN_SCORE else "❌ skip "
-        print(f"  {flag}  score={score}  {title[:60]}")
+        beds = extract_bedrooms(full_text)
+        if beds not in ("Studio", "1BR", "?"):
+            print(f"  SKIP (bedrooms: {beds}) {title[:60]}")
+            continue
 
-        if score >= MIN_SCORE:
-            new_matches.append({**item, "score": score, "reasons": reasons, "beds": beds})
+        item["beds"]       = beds
+        item["parking"]    = parse_parking(full_text)
+        item["laundry"]    = parse_laundry(full_text)
+        item["dishwasher"] = parse_dishwasher(full_text)
+        item["sqft"]       = item.get("sqft", parse_sqft(full_text))
+
+        print(f"  MATCH {title[:60]}")
+        new_matches.append(item)
 
     save_seen(seen)
 
     if is_daytime():
-        # ── Daytime: send immediately ──────────────────────────────────────────
-        # First check if there's a leftover pending batch from overnight
         pending = load_pending()
         if pending:
             print(f"Sending overnight summary ({len(pending)} listings)...")
-            send_email(pending, subject_prefix="🌙 Overnight summary")
+            send_email(pending, subject_prefix="🌙 Overnight summary:")
             clear_pending()
 
         if new_matches:
-            new_matches.sort(key=lambda x: x["score"], reverse=True)
             send_email(new_matches)
         else:
             print("No new matching listings.")
     else:
-        # ── Overnight: accumulate into pending file ────────────────────────────
         if new_matches:
             pending = load_pending()
             pending.extend(new_matches)
             save_pending(pending)
-            print(f"Overnight: saved {len(new_matches)} listings to pending (total pending: {len(pending)})")
+            print(f"Overnight: saved {len(new_matches)} to pending (total: {len(pending)})")
         else:
-            print("Overnight: no new matches, nothing added to pending.")
+            print("Overnight: no new matches.")
 
 if __name__ == "__main__":
     run()
